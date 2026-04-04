@@ -11,6 +11,10 @@ rom_file_path = "ge007.tlbfree.z64"
 
 [patches]
 stubs = [
+    "boot",
+    "resolve_TLBaddress_for_InvalidHit",
+    "initTLBPrepareContext",
+    "eqpower",
 ]
 
 ignored = [

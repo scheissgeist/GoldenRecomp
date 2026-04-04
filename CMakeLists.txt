@@ -46,12 +46,15 @@ target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
 # RecompiledFuncs - Library containing the primary recompiler output
 add_library(RecompiledFuncs STATIC)
 
-target_compile_options(RecompiledFuncs PRIVATE
-    # -Wno-unused-but-set-variable
-    -fno-strict-aliasing
-    -Wno-unused-variable
-    -Wno-implicit-function-declaration
-)
+if (MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(RecompiledFuncs PRIVATE /W0)
+else()
+    target_compile_options(RecompiledFuncs PRIVATE
+        -fno-strict-aliasing
+        -Wno-unused-variable
+        -Wno-implicit-function-declaration
+    )
+endif()
 
 target_include_directories(RecompiledFuncs PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -68,12 +71,15 @@ target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES} ${FUNC_CXX_SOURCES})
 # PatchesLib - Library containing the recompiled output for any custom function patches
 add_library(PatchesLib STATIC)
 
-target_compile_options(PatchesLib PRIVATE
-    # -Wno-unused-but-set-variable
-    -fno-strict-aliasing
-    -Wno-unused-variable
-    -Wno-implicit-function-declaration
-)
+if (MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(PatchesLib PRIVATE /W0)
+else()
+    target_compile_options(PatchesLib PRIVATE
+        -fno-strict-aliasing
+        -Wno-unused-variable
+        -Wno-implicit-function-declaration
+    )
+endif()
 
 target_include_directories(PatchesLib PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -87,7 +93,9 @@ target_sources(PatchesLib PRIVATE
     ${CMAKE_SOURCE_DIR}/RecompiledPatches/patches_bin.c
 )
 
-set_source_files_properties(${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c PROPERTIES COMPILE_FLAGS -fno-strict-aliasing)
+if (NOT MSVC OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/RecompiledPatches/patches.c PROPERTIES COMPILE_FLAGS -fno-strict-aliasing)
+endif()
 
 # Build patches elf
 if(NOT DEFINED PATCHES_C_COMPILER)
@@ -103,7 +111,7 @@ if(NOT DEFINED PATCHES_OBJCOPY)
 endif()
 
 add_custom_target(PatchesBin
-    COMMAND ${CMAKE_COMMAND} -E env CC=${PATCHES_C_COMPILER} LD=${PATCHES_LD} OBJCOPY=${PATCHES_OBJCOPY} make
+    COMMAND ${CMAKE_COMMAND} -E echo "Patches already built externally"
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/patches
     BYPRODUCTS ${CMAKE_SOURCE_DIR}/patches/patches.elf
 )
@@ -200,7 +208,9 @@ target_include_directories(GoldenRecomp PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+if (MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(GoldenRecomp PRIVATE /W3)
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
     target_compile_options(GoldenRecomp PRIVATE
         #-march=nehalem
         -march=core2
@@ -309,6 +319,11 @@ target_link_libraries(GoldenRecomp PRIVATE
     nfd
     lunasvg
 )
+
+# Patches override functions from RecompiledFuncs — allow duplicate symbols
+if (MSVC)
+    target_link_options(GoldenRecomp PRIVATE /FORCE:MULTIPLE)
+endif()
 
 # TODO fix the rt64 CMake script so that this doesn't need to be duplicated here
 # For DXC
