@@ -640,7 +640,7 @@ RECOMP_PATCH void bossMainloop(void) {
                             } else {
                                 waitForNextFrame();
                             }
-                            
+
                             speedgraphRenderGraph();
                             speedgraphMarkerCommit();
                             speedgraphMarkerHandler(0x20000);

@@ -170,6 +170,7 @@ set (SOURCES
     ${CMAKE_SOURCE_DIR}/src/game/scene_table.cpp
     ${CMAKE_SOURCE_DIR}/src/game/debug.cpp
     ${CMAKE_SOURCE_DIR}/src/game/quicksaving.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/audio_cents_patch.cpp
     ${CMAKE_SOURCE_DIR}/src/game/recomp_api.cpp
 
     ${CMAKE_SOURCE_DIR}/src/ui/ui_renderer.cpp

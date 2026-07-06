@@ -7,6 +7,12 @@
 #include <numeric>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstdlib>
+#include <chrono>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include "nfd.h"
 
@@ -166,6 +172,35 @@ static uint32_t output_sample_rate = 48000;
 // Channel count.
 constexpr uint32_t input_channels = 2;
 static uint32_t output_channels = 2;
+static FILE* g_audio_dump_fp = nullptr;
+static std::atomic_bool g_audio_dump_requested{false};
+static bool g_audio_dump_inited = false;
+static std::atomic_bool g_audio_dump_auto_finished{false};
+static std::atomic<uint64_t> g_audio_dump_total_frames{0};
+static std::atomic<uint64_t> g_audio_dump_last_progress_ms{0};
+static std::atomic_bool g_audio_dump_watchdog_started{false};
+static std::mutex g_audio_dump_mutex;
+
+class AudioDumpRendererContext final : public ultramodern::renderer::RendererContext {
+public:
+    AudioDumpRendererContext() {
+        setup_result = ultramodern::renderer::SetupResult::Success;
+        chosen_api = ultramodern::renderer::GraphicsApi::Auto;
+    }
+
+    bool valid() override { return true; }
+    bool update_config(const ultramodern::renderer::GraphicsConfig&, const ultramodern::renderer::GraphicsConfig&) override { return true; }
+    void enable_instant_present() override {}
+    void send_dl(const OSTask*) override {}
+    void update_screen(uint32_t) override {}
+    void shutdown() override {}
+    uint32_t get_display_framerate() const override { return 60; }
+    float get_resolution_scale() const override { return 1.0f; }
+};
+
+static std::unique_ptr<ultramodern::renderer::RendererContext> create_audio_dump_render_context(uint8_t*, ultramodern::renderer::WindowHandle, bool) {
+    return std::make_unique<AudioDumpRendererContext>();
+}
 
 // Terminology: a frame is a collection of samples for each channel. e.g. 2 input samples is one input frame. This is unrelated to graphical frames.
 
@@ -176,7 +211,281 @@ static uint32_t discarded_output_frames;
 
 constexpr uint32_t bytes_per_frame = input_channels * sizeof(float);
 
+static void audio_dump_finalize() {
+    if (!g_audio_dump_fp) {
+        return;
+    }
+
+    uint32_t data_bytes = (uint32_t)(g_audio_dump_total_frames.load() * input_channels * sizeof(int16_t));
+    uint32_t riff_size = data_bytes + 36;
+
+    fseek(g_audio_dump_fp, 4, SEEK_SET);
+    fwrite(&riff_size, sizeof(riff_size), 1, g_audio_dump_fp);
+    fseek(g_audio_dump_fp, 40, SEEK_SET);
+    fwrite(&data_bytes, sizeof(data_bytes), 1, g_audio_dump_fp);
+    fclose(g_audio_dump_fp);
+    g_audio_dump_fp = nullptr;
+}
+
+static uint64_t audio_dump_now_ms() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static uint64_t audio_dump_target_sample_frames() {
+    const char* value = std::getenv("GE_AUDIO_DUMP_FRAMES");
+    const int dump_frames = value ? std::atoi(value) : 3600;
+    return dump_frames > 0 ? (static_cast<uint64_t>(dump_frames) * sample_rate) / 60 : 0;
+}
+
+static void audio_dump_pad_silence_to_target_locked(uint64_t target_sample_frames) {
+    if (!g_audio_dump_fp || target_sample_frames <= g_audio_dump_total_frames.load()) {
+        return;
+    }
+
+    std::array<int16_t, 4096> zeros{};
+    while (g_audio_dump_total_frames.load() < target_sample_frames) {
+        const uint64_t remaining_frames = target_sample_frames - g_audio_dump_total_frames.load();
+        const uint64_t chunk_frames = std::min<uint64_t>(remaining_frames, zeros.size() / input_channels);
+        fwrite(zeros.data(), sizeof(int16_t), static_cast<size_t>(chunk_frames * input_channels), g_audio_dump_fp);
+        g_audio_dump_total_frames.fetch_add(chunk_frames);
+    }
+}
+
+static void audio_dump_init_if_needed() {
+    if (g_audio_dump_inited) {
+        return;
+    }
+
+    g_audio_dump_inited = true;
+    const char* path = std::getenv("GE_AUDIO_DUMP");
+    if (!path || !*path) {
+        return;
+    }
+
+    g_audio_dump_fp = fopen(path, "wb");
+    if (!g_audio_dump_fp) {
+        fprintf(stderr, "GE_AUDIO_DUMP: cannot open %s\n", path);
+        return;
+    }
+
+    uint16_t fmt = 1;
+    uint16_t channels = input_channels;
+    uint16_t bits = 16;
+    uint32_t byte_rate = sample_rate * channels * (bits / 8);
+    uint16_t block_align = channels * (bits / 8);
+    uint32_t placeholder = 0;
+    uint32_t fmt_size = 16;
+
+    fwrite("RIFF", 1, 4, g_audio_dump_fp);
+    fwrite(&placeholder, sizeof(placeholder), 1, g_audio_dump_fp);
+    fwrite("WAVEfmt ", 1, 8, g_audio_dump_fp);
+    fwrite(&fmt_size, sizeof(fmt_size), 1, g_audio_dump_fp);
+    fwrite(&fmt, sizeof(fmt), 1, g_audio_dump_fp);
+    fwrite(&channels, sizeof(channels), 1, g_audio_dump_fp);
+    fwrite(&sample_rate, sizeof(sample_rate), 1, g_audio_dump_fp);
+    fwrite(&byte_rate, sizeof(byte_rate), 1, g_audio_dump_fp);
+    fwrite(&block_align, sizeof(block_align), 1, g_audio_dump_fp);
+    fwrite(&bits, sizeof(bits), 1, g_audio_dump_fp);
+    fwrite("data", 1, 4, g_audio_dump_fp);
+    fwrite(&placeholder, sizeof(placeholder), 1, g_audio_dump_fp);
+
+    atexit(audio_dump_finalize);
+    fprintf(stderr, "GE_AUDIO_DUMP: writing %s @ %u Hz\n", path, sample_rate);
+}
+
+extern "C" void ge_audio_dump_begin_from_game() {
+    g_audio_dump_requested.store(true);
+    g_audio_dump_last_progress_ms.store(audio_dump_now_ms());
+    if (!g_audio_dump_watchdog_started.exchange(true)) {
+        std::thread([]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                const uint64_t target_sample_frames = audio_dump_target_sample_frames();
+                if (g_audio_dump_auto_finished.load() || target_sample_frames == 0) {
+                    continue;
+                }
+
+                const uint64_t now = audio_dump_now_ms();
+                std::lock_guard<std::mutex> lock(g_audio_dump_mutex);
+                const uint64_t locked_total_frames = g_audio_dump_total_frames.load();
+                if (g_audio_dump_auto_finished.load() || g_audio_dump_fp == nullptr ||
+                    locked_total_frames == 0 ||
+                    (locked_total_frames < target_sample_frames && now - g_audio_dump_last_progress_ms.load() < 2000)) {
+                    continue;
+                }
+
+                g_audio_dump_auto_finished.store(true);
+                g_audio_dump_requested.store(false);
+                audio_dump_pad_silence_to_target_locked(target_sample_frames);
+                audio_dump_finalize();
+                fprintf(stderr, "GE_AUDIO_DUMP: watchdog reached sample budget, frames=%" PRIu64 "\n", g_audio_dump_total_frames.load());
+                fflush(stderr);
+                std::_Exit(0);
+            }
+        }).detach();
+    }
+    fprintf(stderr, "GE_AUDIO_DUMP: begin capture\n");
+}
+
+extern "C" void ge_audio_dump_finish_from_game() {
+    g_audio_dump_requested.store(false);
+    audio_dump_finalize();
+    fprintf(stderr, "GE_AUDIO_DUMP: finished capture, frames=%" PRIu64 "\n", g_audio_dump_total_frames.load());
+    fflush(stderr);
+    if (std::getenv("GE_AUDIO_DUMP")) {
+        std::_Exit(0);
+    }
+}
+
+extern "C" void ge_audio_dump_note_generated_trigger(int track, int frames) {
+    fprintf(stderr, "GE_AUDIO_DUMP: generated hook track=%d frames=%d\n", track, frames);
+}
+
+extern "C" void ge_audio_dump_note_generated(const char* label) {
+    if (std::getenv("GE_AUDIO_DEBUG")) {
+        const char* trace_file = std::getenv("GE_AUDIO_DEBUG_FILE");
+        if (trace_file && trace_file[0] != '\0') {
+            FILE* fp = fopen(trace_file, "ab");
+            if (fp) {
+                fprintf(fp, "GE_AUDIO_DUMP: reached %s\n", label ? label : "(null)");
+                fclose(fp);
+            }
+        } else {
+            fprintf(stderr, "GE_AUDIO_DUMP: reached %s\n", label ? label : "(null)");
+        }
+    }
+}
+
+extern "C" void ge_audio_dump_note_value(const char* label, int value) {
+    if (std::getenv("GE_AUDIO_DEBUG")) {
+        const char* trace_file = std::getenv("GE_AUDIO_DEBUG_FILE");
+        if (trace_file && trace_file[0] != '\0') {
+            FILE* fp = fopen(trace_file, "ab");
+            if (fp) {
+                fprintf(fp, "GE_AUDIO_DUMP: %s=0x%08X\n", label ? label : "(null)", (uint32_t)value);
+                fclose(fp);
+            }
+        } else {
+            fprintf(stderr, "GE_AUDIO_DUMP: %s=0x%08X\n", label ? label : "(null)", (uint32_t)value);
+        }
+    }
+}
+
+extern "C" int ge_audio_dump_enabled_native() {
+    return std::getenv("GE_AUDIO_TRACK") ? 1 : 0;
+}
+
+extern "C" int ge_audio_dump_voice_shift_native() {
+    const char* value = std::getenv("GE_AUDIO_DUMP_VOICE_SHIFT");
+    if (!value) {
+        return 0;
+    }
+
+    int shift = std::atoi(value);
+    if (shift < 0) {
+        return 0;
+    }
+    if (shift > 12) {
+        return 12;
+    }
+    return shift;
+}
+
+extern "C" int ge_audio_dump_seqp_shift_native() {
+    const char* value = std::getenv("GE_AUDIO_DUMP_SEQP_SHIFT");
+    if (!value) {
+        return 0;
+    }
+
+    int shift = std::atoi(value);
+    if (shift < 0) {
+        return 0;
+    }
+    if (shift > 12) {
+        return 12;
+    }
+    return shift;
+}
+
+extern "C" int ge_audio_dump_music_default_volume_native(int track) {
+    static constexpr uint16_t kDefaultTrackVolume[] = {
+        0x6665, 0x7332, 0x7332, 0x7998, 0x7332, 0x5998, 0x6665, 0x6665,
+        0x6665, 0x6665, 0x7332, 0x6665, 0x7332, 0x6665, 0x6665, 0x7332,
+        0x7332, 0x6665, 0x3FFF, 0x6665, 0x6665, 0x3FFF, 0x6665, 0x6665,
+        0x6665, 0x6665, 0x6665, 0x7998, 0x6665, 0x5998, 0x6665, 0x6665,
+        0x6665, 0x6665, 0x6665, 0x6665, 0x6665, 0x5998, 0x6665, 0x3332,
+        0x6665, 0x7332, 0x7332, 0x5998, 0x7332, 0x6665, 0x6665, 0x6665,
+        0x6665, 0x6665, 0x6665, 0x6665, 0x6CCB, 0x6665, 0x6665, 0x6665,
+        0x6665, 0x6665, 0x6665, 0x6665, 0x7332, 0x6665, 0x7332, 0x7998,
+        0xFFFF,
+    };
+
+    constexpr size_t volume_count = sizeof(kDefaultTrackVolume) / sizeof(kDefaultTrackVolume[0]);
+    if (track < 0 || static_cast<size_t>(track) >= volume_count) {
+        return 0x6665;
+    }
+    return kDefaultTrackVolume[track];
+}
+
+extern "C" int ge_audio_dump_get_track_native() {
+    const char* value = std::getenv("GE_AUDIO_TRACK");
+    return value ? std::atoi(value) : 0;
+}
+
+extern "C" int ge_audio_dump_get_slot_native() {
+    const char* value = std::getenv("GE_AUDIO_SLOT");
+    int slot = value ? std::atoi(value) : 1;
+    if (slot < 1 || slot > 3) {
+        slot = 1;
+    }
+    return slot;
+}
+
+extern "C" int ge_audio_dump_get_frames_native() {
+    const char* value = std::getenv("GE_AUDIO_DUMP_FRAMES");
+    return value ? std::atoi(value) : 3600;
+}
+
+extern "C" void ge_audio_dump_quit_from_game() {
+    ge_audio_dump_finish_from_game();
+    ultramodern::quit();
+}
+
 void queue_samples(int16_t* audio_data, size_t sample_count) {
+    if (g_audio_dump_requested.load()) {
+        audio_dump_init_if_needed();
+        std::lock_guard<std::mutex> lock(g_audio_dump_mutex);
+        if (g_audio_dump_fp) {
+            fwrite(audio_data, sizeof(int16_t), sample_count, g_audio_dump_fp);
+            const uint64_t total_frames = g_audio_dump_total_frames.fetch_add(sample_count / input_channels) + (sample_count / input_channels);
+            g_audio_dump_last_progress_ms.store(audio_dump_now_ms());
+            const uint64_t target_sample_frames = audio_dump_target_sample_frames();
+            if (!g_audio_dump_auto_finished.load() && target_sample_frames > 0 && total_frames >= target_sample_frames) {
+                g_audio_dump_auto_finished.store(true);
+                g_audio_dump_requested.store(false);
+                audio_dump_finalize();   /* fclose() - WAV is fully on disk here */
+                fprintf(stderr, "GE_AUDIO_DUMP: sample budget reached, frames=%" PRIu64 "\n", g_audio_dump_total_frames.load());
+                fflush(stderr);
+                /* Hard-exit the process. The WAV is finalized + fclose'd above, so all
+                 * audio data is on disk. We must NOT go through normal teardown:
+                 * std::exit / ultramodern::quit both run global dtors and tear down the
+                 * RT64 "Present" render thread, which in headless audio-dump mode races
+                 * the still-live game/RSP threads and segfaults (gdb: SIGSEGV in thread
+                 * "RT64 Present" during teardown). _exit() terminates immediately with
+                 * no atexit/dtors/RT64 shutdown - nothing left to corrupt since the only
+                 * artifact (the WAV) is already closed. This is the right call for a
+                 * one-shot headless dump tool: produce the file, then die hard.
+                 * std::_Exit (C++11, <cstdlib>) is the portable no-teardown exit. */
+                std::_Exit(0);
+            }
+        }
+    }
+
+    if (std::getenv("GE_AUDIO_DUMP")) {
+        return;
+    }
+
     // Buffer for holding the output of swapping the audio channels. This is reused across
     // calls to reduce runtime allocations.
     static std::vector<float> swap_buffer;
@@ -589,20 +898,43 @@ int main(int argc, char** argv) {
     zelda64::register_patches();
 
     recomp::register_config_path(zelda64::get_app_folder_path());
+
+    if (const char* rom_path = std::getenv("GE_ROM_PATH")) {
+        if (*rom_path) {
+            auto game_id = supported_games[0].game_id;
+            recomp::RomValidationError rom_error = recomp::select_rom(std::filesystem::path{ rom_path }, game_id);
+            if (rom_error != recomp::RomValidationError::Good) {
+                fprintf(stderr, "GE_ROM_PATH: ROM validation failed for %s (%d)\n", rom_path, (int)rom_error);
+            } else {
+                fprintf(stderr, "GE_ROM_PATH: selected %s\n", rom_path);
+            }
+        }
+    }
+
     zelda64::load_config();
+
+    if (std::getenv("GE_AUDIO_TRACK")) {
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            fprintf(stderr, "GE_AUDIO_TRACK: auto-starting game\n");
+            recomp::start_game(supported_games[0].game_id);
+        }).detach();
+    }
 
     recomp::rsp::callbacks_t rsp_callbacks{
         .get_rsp_microcode = get_rsp_microcode,
     };
 
+    const bool audio_dump_mode = std::getenv("GE_AUDIO_DUMP") != nullptr;
+
     ultramodern::renderer::callbacks_t renderer_callbacks{
-        .create_render_context = zelda64::renderer::create_render_context,
+        .create_render_context = audio_dump_mode ? create_audio_dump_render_context : zelda64::renderer::create_render_context,
     };
 
     ultramodern::gfx_callbacks_t gfx_callbacks{
-        .create_gfx = create_gfx,
-        .create_window = create_window,
-        .update_gfx = update_gfx,
+        .create_gfx = audio_dump_mode ? nullptr : create_gfx,
+        .create_window = audio_dump_mode ? nullptr : create_window,
+        .update_gfx = audio_dump_mode ? nullptr : update_gfx,
     };
 
     ultramodern::audio_callbacks_t audio_callbacks{
@@ -620,7 +952,7 @@ int main(int argc, char** argv) {
 
     ultramodern::events::callbacks_t thread_callbacks{
         .vi_callback = recomp::update_rumble,
-        .gfx_init_callback = recompui::update_supported_options,
+        .gfx_init_callback = audio_dump_mode ? nullptr : recompui::update_supported_options,
     };
 
     ultramodern::error_handling::callbacks_t error_handling_callbacks{
@@ -631,9 +963,16 @@ int main(int argc, char** argv) {
         .get_game_thread_name = zelda64::get_game_thread_name,
     };
 
+    ultramodern::renderer::WindowHandle window_handle{};
+#if defined(_WIN32)
+    if (audio_dump_mode) {
+        window_handle = ultramodern::renderer::WindowHandle{ nullptr, GetCurrentThreadId() };
+    }
+#endif
+
     recomp::start(
         project_version,
-        {},
+        window_handle,
         rsp_callbacks,
         renderer_callbacks,
         audio_callbacks,
