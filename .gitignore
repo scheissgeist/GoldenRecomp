@@ -62,6 +62,9 @@ vcpkg_installed/
 imgui.ini
 rt64.log
 
+# GoldenSouls audio extraction probes; regenerated and often very large.
+_tmp_*
+
 node_modules/
 
 # Recompiler Linux binary
