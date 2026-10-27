@@ -7,10 +7,28 @@
 *.elf
 *.z64
 *.map
+# Other N64 ROM formats and raw ROM segments. Upper-case variants matter on
+# case-sensitive filesystems. Never commit anything read out of the ROM.
+*.Z64
+*.n64
+*.N64
+*.v64
+*.V64
+*.rom
+*.ndd
+*.bin
 
 # Output C files
 RecompiledFuncs/
 RecompiledPatches/
+# RSPRecomp output (generated from the ROM's RSP microcode, e.g. aspMain.cpp)
+/rsp/*.cpp
+
+# Audio extracted from the ROM by the GE_AUDIO_DUMP harness
+*.wav
+*.aiff
+*.aifc
+_tmp_*
 
 # Linux build output
 build/
